@@ -1,0 +1,238 @@
+Import boto3
+import time
+
+# AWS Clients
+
+ssm = boto3.client("ssm")
+redshift = boto3.client("redshift-data")
+sns = boto3.client("sns")
+
+
+# Redshift Configuration
+
+REDSHIFT_CLUSTER = "grp-4"
+REDSHIFT_DATABASE = "retail"
+REDSHIFT_SECRET_ARN = "arn:aws:secretsmanager:eu-central-1:831645032705:secret:retail_redshift-PA27Go"
+REDSHIFT_IAM_ROLE = "arn:aws:iam::831645032705:role/service-role/AmazonRedshift-CommandsAccessRole-20250510T024044"
+
+
+# S3 Paths for Data Loading
+s3_data_base = "s3://retail-etl/cleaned-data1/"
+
+# SNS Topic ARN
+SNS_TOPIC_ARN = "arn:aws:sns:eu-central-1:831645032705:glue-job-notifications"
+
+# Updated COPY commands using Parquet format
+copy_commands = {
+"customers": f"""
+COPY customers (customer_id, name, email, phone_number, age, loyalty_status, membership_tier, address, registration_date)
+FROM '{s3_data_base}customers.parquet'
+IAM_ROLE '{REDSHIFT_IAM_ROLE}'
+FORMAT AS PARQUET;
+""",
+"products": f"""
+
+COPY products (product_id, name, brand, category, price, discount_percentage, supplier_id, rating_avg, inventory_count)
+FROM '{s3_data_base}products.parquet'
+IAM_ROLE '{REDSHIFT_IAM_ROLE}'
+FORMAT AS PARQUET;
+""",
+
+"orders": f"""
+COPY orders (order_id, customer_id, product_id, order_date, quantity, total_price, shipping_cost, delivery_type, promo_code_applied, gift_wrapping, payment_status)
+FROM '{s3_data_base}orders.parquet'
+IAM_ROLE '{REDSHIFT_IAM_ROLE}'
+FORMAT AS PARQUET;
+""",
+
+"payments": f"""
+COPY payments (payment_id, order_id, amount, payment_mode, transaction_id, bank_name, currency, payment_status)
+FROM '{s3_data_base}payments.parquet'
+IAM_ROLE '{REDSHIFT_IAM_ROLE}'
+FORMAT AS PARQUET;
+""",
+
+"reviews": f"""
+COPY reviews (review_id, order_id, customer_id, rating, review_text, sentiment_score, review_length, device_used, verified_purchase)
+FROM '{s3_data_base}reviews.parquet'
+IAM_ROLE '{REDSHIFT_IAM_ROLE}'
+FORMAT AS PARQUET;
+"""
+}
+
+
+def send_sns_notification(subject, message):
+"""Send a notification to SNS."""
+try:
+response = sns.publish(
+TopicArn=SNS_TOPIC_ARN,
+Subject=subject,
+Message=message
+)
+
+print(f"SNS notification sent: {subject}")
+except Exception as e:
+print(f"Error sending SNS notification: {e}")
+
+def execute_redshift_command(sql):
+"""Executes a single SQL command in Redshift with error handling."""
+print(f"Executing SQL: {sql}")
+try:
+response = redshift.execute_statement(
+ClusterIdentifier=REDSHIFT_CLUSTER,
+Database=REDSHIFT_DATABASE,
+Sql=sql,
+SecretArn=REDSHIFT_SECRET_ARN
+)
+
+statement_id = response["Id"]
+print(f"Successfully executed: {sql}, Statement ID: {statement_id}")
+return statement_id
+
+except Exception as e:
+print(f"Error executing SQL: {sql}, Error: {str(e)}")
+send_sns_notification("Redshift Command Failed", f"Error executing SQL: {sql}\nError: {e}")
+return None
+
+
+def check_redshift_execution(statement_id):
+
+"""Checks the status of the Redshift execution using the correct statement ID."""
+
+if not statement_id:
+
+return "FAILED"
+
+
+try:
+
+response = redshift.describe_statement(Id=statement_id)
+
+return response["Status"]
+
+except Exception as e:
+
+print(f"Error fetching Redshift execution status for ID {statement_id}: {str(e)}")
+
+return "FAILED"
+
+
+def check_flag(table_name):
+
+"""Check if a COPY operation has already run for a table."""
+
+try:
+
+response = ssm.get_parameter(Name=f"redshift_copy_flag_{table_name}")
+
+return response["Parameter"]["Value"] == "done"
+
+except ssm.exceptions.ParameterNotFound:
+
+return False
+
+
+def set_flag(table_name):
+
+"""Set a flag in SSM Parameter Store to indicate COPY has run."""
+
+ssm.put_parameter(
+
+Name=f"redshift_copy_flag_{table_name}",
+
+Value="done",
+
+Type="String",
+
+Overwrite=True
+
+)
+
+print(f"Flag set: COPY completed for {table_name}")
+
+
+def reset_flags():
+
+"""Deletes all COPY execution flags in SSM."""
+
+tables = ["customers", "products", "orders", "payments", "reviews"]
+
+for table in tables:
+
+try:
+
+ssm.delete_parameter(Name=f"redshift_copy_flag_{table}")
+
+print(f"Reset flag for {table}")
+
+except ssm.exceptions.ParameterNotFound:
+
+print(f"No flag found for {table}, skipping reset.")
+
+
+def lambda_handler(event, context):
+
+"""Executes Redshift data loading only once per table using flags."""
+
+print("Resetting flags before executing COPY...")
+
+reset_flags()
+
+
+print("Truncating tables to ensure a clean load...")
+
+execute_redshift_command("TRUNCATE TABLE customers;")
+
+execute_redshift_command("TRUNCATE TABLE products;")
+
+execute_redshift_command("TRUNCATE TABLE orders;")
+
+execute_redshift_command("TRUNCATE TABLE payments;")
+
+execute_redshift_command("TRUNCATE TABLE reviews;")
+
+
+time.sleep(5)
+
+
+print("Starting COPY process with flag-based control...")
+
+for table, sql in copy_commands.items():
+
+print(f"Checking execution for {table}...")
+
+if not check_flag(table):
+
+print(f"Executing COPY for table: {table}")
+
+statement_id = execute_redshift_command(sql)
+
+
+time.sleep(5)
+
+status = check_redshift_execution(statement_id)
+
+if status == "FAILED":
+
+print(f"ERROR: COPY failed for table {table}")
+
+send_sns_notification("Redshift COPY Failed", f"COPY command failed for table {table}")
+
+else:
+
+set_flag(table)
+
+print(f"Successfully copied data into {table}")
+
+send_sns_notification("Redshift COPY Successful", f"COPY command completed for table {table}")
+
+time.sleep(10)
+
+else:
+
+print(f"Skipping COPY for {table}, flag already set.")
+
+
+print("Data load complete with flag-based tracking!")
+
+send_sns_notification("Redshift Data Load Completed", "All tables have been processed.")
