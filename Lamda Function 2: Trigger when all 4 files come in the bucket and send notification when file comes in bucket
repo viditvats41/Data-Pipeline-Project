@@ -1,0 +1,92 @@
+import json
+
+import boto3
+
+from datetime import datetime
+
+
+SNS_TOPIC_ARN = "arn:aws:sns:eu-central-1:831645032705:glue-job-notifications"
+
+GLUE_JOB_NAMES = ["final_redshift", "final_rds"] # List of Glue jobs
+
+DYNAMODB_TABLE = "FileTracker"
+
+
+s3_client = boto3.client("s3")
+
+sns_client = boto3.client("sns")
+
+glue_client = boto3.client("glue")
+
+dynamodb_client = boto3.client("dynamodb")
+
+
+def lambda_handler(event, context):
+
+try:
+
+# Get file details
+
+bucket_name = event["Records"][0]["s3"]["bucket"]["name"]
+
+object_key = event["Records"][0]["s3"]["object"]["key"]
+
+timestamp = datetime.utcnow().isoformat()
+
+
+# Send email notification
+
+message = f"New file received: s3://{bucket_name}/{object_key}. Running Glue jobs..."
+
+sns_client.publish(TopicArn=SNS_TOPIC_ARN, Message=message, Subject="File Upload Notification")
+
+
+job_ids = []
+
+for job_name in GLUE_JOB_NAMES:
+
+# Start Glue job
+
+response = glue_client.start_job_run(JobName=job_name)
+
+job_id = response["JobRunId"]
+
+job_ids.append({"job_name": job_name, "job_id": job_id})
+
+
+# Store job status in DynamoDB
+
+dynamodb_client.put_item(
+
+TableName=DYNAMODB_TABLE,
+
+Item={
+
+"file_name": {"S": object_key},
+
+"timestamp": {"S": timestamp},
+
+"status": {"S": "Processing"},
+
+"job_id": {"S": job_id},
+
+"job_name": {"S": job_name}
+
+}
+
+)
+
+
+# Notify that Glue job started
+
+sns_client.publish(TopicArn=SNS_TOPIC_ARN, Message=f"Glue job {job_name} started. Job ID: {job_id}", Subject="Glue Job Started")
+
+
+return {"status": "success", "job_ids": job_ids}
+
+
+except Exception as e:
+
+sns_client.publish(TopicArn=SNS_TOPIC_ARN, Message=f"Error: {str(e)}", Subject="Glue Job Failed")
+
+return {"status": "error", "message": str(e)}
