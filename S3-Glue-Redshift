@@ -1,0 +1,156 @@
+import boto3
+from botocore.exceptions import ClientError
+import json
+
+def get_secret():
+secret_name = "retail_redshift"
+region_name = "eu-central-1"
+
+# Create a Secrets Manager client
+session = boto3.session.Session()
+client = session.client(
+service_name='secretsmanager',
+region_name=region_name
+)
+try:
+get_secret_value_response = client.get_secret_value(
+SecretId=secret_name
+)
+except ClientError as e:
+
+# For a list of exceptions thrown, see
+
+# https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+raise e
+secret_dict = json.loads(get_secret_value_response['SecretString'])
+return secret_dict # Return as dictionary
+secrets = get_secret()
+
+
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, lower, trim, regexp_replace, when
+import boto3
+
+# Initialize Spark and Glue contexts
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init("final_redshift_cleaning", args={})
+
+# Redshift connection properties
+
+REDSHIFT_URL = "jdbc:redshift://grp-4.cifyck0vrupy.eu-central-1.redshift.amazonaws.com:5439/test"
+REDSHIFT_USER = secrets["username"]
+REDSHIFT_PASSWORD = secrets["password"]
+REDSHIFT_DRIVER = "com.amazon.redshift.jdbc42.Driver"
+
+# Functions to read data
+
+def read_customers_data(path):
+return spark.read.json(path)
+
+def read_orders_data(path):
+return spark.read.option("header", "true").csv(path)
+
+def read_payments_data(path):
+return spark.read.option("header", "true").csv(path)
+
+def read_reviews_data(path):
+return spark.read.json(path)
+
+
+def read_products_data(path):
+return spark.read.parquet(path)
+
+# Cleaning functions
+
+def clean_customers(df):
+columns_order = ["customer_id", "name", "email", "phone_number", "age", "loyalty_status", "membership_tier", "address", "registration_date"]
+df = df.withColumn("name", df["name"].cast("string"))
+df = df.withColumn("email", lower(col("email")))
+df = df.withColumn("email", when(col("email").rlike(r"^[^@]+@[^@]+\.[a-zA-Z]{2,}$"), col("email")).otherwise("invalid@email.com"))
+df = df.withColumn("phone_number", trim(col("phone_number")))
+df = df.withColumn("phone_number", regexp_replace(col("phone_number"), "^001-", "+1-"))
+df = df.withColumn("phone_number", regexp_replace(col("phone_number"), "^([0-9]{3})[.]", "\\1-"))
+df = df.withColumn("is_valid_format", col("phone_number").rlike("^[0-9+()\\-.]+$"))
+df = df.withColumn("phone_number", when((col("is_valid_format") == False) | (col("phone_number").isNull()) | (col("phone_number") == ""), "Invalid").otherwise(col("phone_number")))
+df = df.drop("is_valid_format")
+df = df.withColumn("registration_date", regexp_replace(col("registration_date"), "/", "-"))
+df = df.fillna({"phone_number": "Invalid", "loyalty_status": "Inactive", "membership_tier": "Standard", "address": "Not Provided"})
+return df.select(columns_order).dropDuplicates(["customer_id"])
+
+
+def clean_orders(df):
+columns_order = ["order_id", "customer_id", "product_id", "order_date", "quantity", "total_price", "shipping_cost", "delivery_type", "promo_code_applied", "gift_wrapping", "payment_status"]
+df = df.withColumn("order_date", regexp_replace(col("order_date"), "/", "-"))
+df = df.withColumn("quantity", col("quantity").cast("int"))
+df = df.withColumn("total_price", when(col("total_price") < 0, None).otherwise(col("total_price")).cast("double"))
+df = df.fillna({"delivery_type": "Standard", "payment_status": "Pending"})
+return df.select(columns_order).dropDuplicates()
+
+
+def clean_payments(df):
+columns_order = ["payment_id", "order_id", "amount", "payment_mode", "transaction_id", "bank_name", "currency", "payment_status"]
+df = df.withColumn("amount", when(col("amount") < 0, None).otherwise(col("amount")).cast("double"))
+df = df.fillna({"payment_mode": "Unknown", "payment_status": "Pending"})
+return df.select(columns_order).dropDuplicates()
+
+
+def clean_reviews(df):
+columns_order = ["review_id", "order_id", "customer_id", "rating", "review_text", "sentiment_score", "review_length", "device_used", "verified_purchase"]
+df = df.withColumn("review_text", trim(col("review_text")))
+df = df.withColumn("sentiment_score", col("sentiment_score").cast("decimal(3,2)"))
+df = df.withColumn("review_length", when(col("review_length") < 0, None).otherwise(col("review_length")).cast("int"))
+df = df.fillna({"verified_purchase": "No"})
+return df.select(columns_order).dropDuplicates()
+
+
+def clean_products(df):
+columns_order = ["product_id", "name", "brand", "category", "price", "discount_percentage", "supplier_id", "rating_avg", "inventory_count"]
+df = df.withColumn("price", when(col("price") < 0, None).otherwise(col("price")).cast("decimal(10,2)"))
+df = df.withColumn("discount_percentage", when((col("discount_percentage") < 0) | (col("discount_percentage") > 100), None).otherwise(col("discount_percentage")))
+df = df.withColumn("inventory_count", when(col("inventory_count") < 0, None).otherwise(col("inventory_count")).cast("int"))
+df = df.fillna({"brand": "Unknown", "category": "Miscellaneous", "supplier_id": "Not Available"})
+return df.select(columns_order).dropDuplicates()
+
+
+def get_partition_count(df):
+return max(1, df.count() // 100000) # Adjust based on dataset size
+
+# Writing cleaned data to Redshift efficiently with partition count
+
+def write_to_redshift(df, table_name):
+partition_count = get_partition_count(df) # Dynamically determine partition count
+df.write \
+.format("jdbc") \
+.option("url", REDSHIFT_URL) \
+.option("dbtable", table_name) \
+.option("user", REDSHIFT_USER) \
+.option("password", REDSHIFT_PASSWORD) \
+.option("driver", REDSHIFT_DRIVER) \
+.option("numPartitions", partition_count) \
+.option("batchsize", 100000) \
+.mode("append") \
+.save()
+
+
+
+# Processing and writing cleaned data to Redshift
+
+customers_df = clean_customers(read_customers_data("s3://retail-etl/raw-data/customers/customers.json"))
+orders_df = clean_orders(read_orders_data("s3://retail-etl/raw-data/orders/orders.csv"))
+payments_df = clean_payments(read_payments_data("s3://retail-etl/raw-data/payments/payments.csv"))
+reviews_df = clean_reviews(read_reviews_data("s3://retail-etl/raw-data/reviews/reviews.json"))
+products_df = clean_products(read_products_data("s3://retail-etl/raw-data/products/products.parquet"))
+
+
+write_to_redshift(customers_df, "customers")
+write_to_redshift(orders_df, "orders")
+write_to_redshift(payments_df, "payments")
+write_to_redshift(reviews_df, "reviews")
+write_to_redshift(products_df, "products")
+job.commit()
