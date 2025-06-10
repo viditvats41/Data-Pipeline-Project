@@ -1,0 +1,199 @@
+import boto3
+import json
+
+from botocore.exceptions import ClientError
+def get_secret():
+secret_name = "retail_rds"
+region_name = "eu-central-1"
+
+# Create a Secrets Manager client
+session = boto3.session.Session()
+client = session.client(
+service_name='secretsmanager',
+region_name=region_name
+)
+try:
+get_secret_value_response = client.get_secret_value(
+SecretId=secret_name
+)
+except ClientError as e:
+
+# For a list of exceptions thrown, see
+raise e
+secret = get_secret_value_response['SecretString']
+
+secret_dict = json.loads(get_secret_value_response['SecretString'])
+
+return secret_dict # Return as dictionary
+secrets = get_secret()
+
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lower, trim, regexp_replace, when, length
+
+# Initialize Spark and Glue Contexts
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+# Initialize Glue Job
+
+job = Job(glueContext)
+job.init("ecommerce_data_cleaning", args={})
+
+# Amazon RDS connection details
+
+RDS_URL = "jdbc:mysql://database-1.cjyygom0y9rw.eu-central-1.rds.amazonaws.com:3306/ecommerce"
+RDS_USER = secrets['username']
+RDS_PASSWORD = secrets['password']
+
+
+# ------------------ File Readers ------------------
+
+def read_customers_data(path: str):
+return spark.read.json(path)
+
+def read_orders_data(path: str):
+return spark.read.option("header", "true").csv(path)
+
+def read_payments_data(path: str):
+return spark.read.option("header", "true").csv(path)
+
+def read_shipments_data(path: str):
+return spark.read.parquet(path)
+
+
+# ------------------ Cleaning Functions ------------------
+
+
+def clean_customers(df):
+df = df.withColumn("email", lower(col("email")))
+
+df = df.withColumn("email", when(col("email").rlike(r"^[^@]+@[^@]+\.[a-zA-Z]{2,}$"), col("email")).otherwise("invalid@email.com"))
+
+# Phone number cleaning
+
+df = df.withColumn("phone_number", trim(col("phone_number")))
+df = df.withColumn("phone_number", regexp_replace(col("phone_number"), "^001-", "+1-"))
+df = df.withColumn("phone_number", regexp_replace(col("phone_number"), "^([0-9]{3})[.]", "\\1-"))
+df = df.withColumn("is_valid_format", col("phone_number").rlike("^[0-9+()\\-.]+$"))
+df = df.withColumn("phone_number", when((col("is_valid_format") == False) | (length(col("phone_number")) < 10), "Invalid").otherwise(col("phone_number")))
+df = df.drop("is_valid_format")
+df = df.withColumn("registration_date", regexp_replace(col("registration_date"), "/", "-"))
+
+df = df.fillna({
+"phone_number": "Invalid",
+"loyalty_status": "Inactive",
+"membership_tier": "Standard",
+"address": "Not Provided"
+})
+
+
+# Drop duplicates based on `customer_id` to avoid primary key conflicts
+
+df = df.dropDuplicates(["customer_id"])
+return df
+
+
+def clean_orders(df):
+df = df.withColumn("order_date", regexp_replace(col("order_date"), "/", "-"))
+df = df.withColumn("quantity", col("quantity").cast("int"))
+df = df.withColumn("total_price", when(col("total_price") < 0, None).otherwise(col("total_price")).cast("double"))
+df = df.withColumn("shipping_cost", when(col("shipping_cost") < 0, None).otherwise(col("shipping_cost")).cast("double"))
+
+df = df.fillna({
+"delivery_type": "Standard",
+"promo_code_applied": "No",
+"gift_wrapping": "No",
+"payment_status": "Pending"
+})
+
+return df.dropDuplicates()
+
+
+def clean_payments(df):
+df = df.withColumn("amount", when(col("amount") < 0, None).otherwise(col("amount")).cast("double"))
+df = df.fillna({
+"payment_mode": "Unknown",
+"bank_name": "Not Provided",
+"currency": "USD",
+"payment_status": "Pending"
+})
+
+return df.dropDuplicates()
+
+
+def clean_shipments(df):
+df = df.withColumn("delivery_date", regexp_replace(col("delivery_date"), "/", "-"))
+df = df.withColumn("estimated_days", when(col("estimated_days") < 0, None).otherwise(col("estimated_days")).cast("int"))
+
+df = df.fillna({
+"insurance_covered": "Unknown",
+"status": "In Transit"
+})
+
+
+return df.dropDuplicates()
+
+
+# ------------------ Adaptive Partitioning ------------------
+
+
+def get_partition_count(df):
+return max(1, df.count() // 100000) # Adjust based on dataset size
+
+
+# ------------------ RDS Writer ------------------
+
+
+def write_to_rds(df, table: str):
+partition_count = get_partition_count(df)
+
+df.write \
+.format("jdbc") \
+.option("url", RDS_URL) \
+.option("dbtable", table) \
+.option("user", RDS_USER) \
+.option("password", RDS_PASSWORD) \
+.option("driver", "com.mysql.cj.jdbc.Driver") \
+.option("numPartitions", partition_count) \
+.mode("append") \
+.save()
+print(f"Data written to RDS table: {table}")
+
+
+# ------------------ ETL Execution ------------------
+
+
+# Customers
+
+customers_df = read_customers_data("s3://retail-etl/raw-data/customers/customers.json")
+customers_df = clean_customers(customers_df)
+write_to_rds(customers_df, "customers")
+
+# Orders
+
+orders_df = read_orders_data("s3://retail-etl/raw-data/orders/orders.csv")
+orders_df = clean_orders(orders_df)
+write_to_rds(orders_df, "orders")
+
+# Payments
+
+payments_df = read_payments_data("s3://retail-etl/raw-data/payments/payments.csv")
+payments_df = clean_payments(payments_df)
+write_to_rds(payments_df, "payments")
+
+# Shipments
+
+shipments_df = read_shipments_data("s3://retail-etl/raw-data/shipments/shipments.parquet")
+shipments_df = clean_shipments(shipments_df)
+write_to_rds(shipments_df, "shipments")
+
+# Commit job
+
+job.commit()
